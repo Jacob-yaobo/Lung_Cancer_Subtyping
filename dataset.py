@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from typing import Dict, List, Tuple, Optional, Any, Set
 from util import get_center_abbreviation, get_pid_format
 
@@ -56,6 +56,7 @@ class DataManager:
         print(f"- 训练样本数: {len(self.train_pids)}")
         print(f"- 验证样本数: {len(self.val_pids)}")
         print(f"- 训练标签分布: {self.train_class_counts}")
+        print(f"- 训练样本权重数量: {len(self.train_sample_weights)}")
     
     def _load_metadata(self):
         """加载所有元数据文件"""
@@ -129,6 +130,14 @@ class DataManager:
         self.val_labels = val_df['pathology'].map(self.label_map).tolist()
         
         self.train_class_counts = train_df['pathology'].value_counts().to_dict()
+        
+        # 计算训练样本权重 (用于平衡采样)
+        # 创建按类别索引排序的权重列表: 权重 = 1.0 / 该类别的样本数
+        from collections import Counter
+        label_counts = Counter(self.train_labels)
+        class_weights_by_index = [1.0 / label_counts[i] for i in range(len(self.label_map))]
+        # 为每个训练样本分配对应的权重
+        self.train_sample_weights = [class_weights_by_index[label] for label in self.train_labels]
         
         # 创建完整的PID到pathology映射 (用于可能的外部查询)
         self.pid_to_pathology = dict(zip(task_subjects_df['combined_pid'], task_subjects_df['pathology']))
@@ -337,6 +346,88 @@ def create_dataloaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, 
     
     return train_dataloader, val_dataloader, data_manager
 
+
+def create_balanced_dataloaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, DataManager]:
+    """
+    创建平衡的训练和验证数据加载器
+    
+    使用WeightedRandomSampler对训练集进行平衡采样，以处理类别不平衡问题。
+    
+    Args:
+        config: YAML配置字典
+        
+    Returns:
+        tuple: (平衡的训练数据加载器, 验证数据加载器, 数据管理器)
+    """
+    
+    # 创建数据管理器 - 只需实例化一次
+    data_manager = DataManager(config)
+    
+    # 设置数据增强变换
+    train_transforms = get_transforms("train")
+    val_transforms = get_transforms("val")
+    
+    # 创建数据集实例
+    train_dataset = LungCancerDataset(
+        data_root=data_manager.data_root,
+        pids=data_manager.train_pids,
+        labels=data_manager.train_labels,
+        modalities=data_manager.modalities,
+        dtype=data_manager.dtype,
+        transforms=train_transforms
+    )
+    
+    val_dataset = LungCancerDataset(
+        data_root=data_manager.data_root,
+        pids=data_manager.val_pids,
+        labels=data_manager.val_labels,
+        modalities=data_manager.modalities,
+        dtype=data_manager.dtype,
+        transforms=val_transforms
+    )
+    
+    # 获取数据加载器配置
+    train_config = config["dataloader"]["train"]
+    val_config = config["dataloader"]["val"]
+    
+    # 创建加权随机采样器用于训练集平衡
+    train_sampler = WeightedRandomSampler(
+        weights=data_manager.train_sample_weights,
+        num_samples=len(data_manager.train_sample_weights),
+        replacement=True  # 允许重复采样以实现平衡
+    )
+    
+    # 创建平衡的训练数据加载器
+    # 注意：使用sampler时必须设置shuffle=False
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_config["batch_size"],
+        sampler=train_sampler,  # 使用加权采样器
+        shuffle=False,          # 采样器处理随机化，必须设为False
+        num_workers=train_config["num_workers"],
+        pin_memory=train_config["pin_memory"],
+        drop_last=train_config["drop_last"]
+    )
+    
+    # 验证数据加载器保持不变
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=val_config["batch_size"],
+        shuffle=val_config["shuffle"],
+        num_workers=val_config["num_workers"],
+        pin_memory=val_config["pin_memory"],
+        drop_last=val_config["drop_last"]
+    )
+    
+    print(f"\n平衡数据加载器创建完成:")
+    print(f"- 训练数据增强: {'启用' if train_transforms else '禁用'}")
+    print(f"- 验证数据增强: {'启用' if val_transforms else '禁用'}")
+    print(f"- 训练集采样器: {type(train_sampler).__name__}")
+    print(f"- 采样权重数量: {len(data_manager.train_sample_weights)}")
+    
+    return train_dataloader, val_dataloader, data_manager
+
+
 if __name__ == "__main__":
     # 测试代码
     print("测试重构后的Dataset类...")
@@ -344,8 +435,17 @@ if __name__ == "__main__":
     # 加载配置
     config = load_config("config.yaml")
     
-    # 创建数据加载器和数据管理器
-    train_loader, val_loader, data_manager = create_dataloaders(config)
+    # 测试标准数据加载器
+    print("\n" + "="*60)
+    print("测试标准数据加载器")
+    print("="*60)
+    # train_loader, val_loader, data_manager = create_dataloaders(config)
+    
+    # 测试平衡数据加载器
+    print("\n" + "="*60)
+    print("测试平衡数据加载器")
+    print("="*60)
+    train_loader, val_loader, data_manager = create_balanced_dataloaders(config)
     
     # 显示数据管理器统计信息
     print(f"\n数据管理器统计:")
@@ -353,6 +453,7 @@ if __name__ == "__main__":
     print(f"- 训练类别分布: {data_manager.train_class_counts}")
     print(f"- 训练样本数: {len(data_manager.train_pids)}")
     print(f"- 验证样本数: {len(data_manager.val_pids)}")
+    print(f"- 训练集采样器: {type(train_loader.sampler).__name__}")
     
     # 测试加载一个批次
     print("\n测试数据加载:")
@@ -362,19 +463,41 @@ if __name__ == "__main__":
         batch_data, batch_labels = next(train_iter)
         print(f"训练批次数据形状: {batch_data.shape}")
         print(f"训练批次标签形状: {batch_labels.shape}")
-        print(f"训练标签样例: {batch_labels[:5]}")
+        print(f"训练标签样例: {batch_labels}")
+        
+        # 分析平衡效果 - 统计多个批次的标签分布
+        print(f"\n平衡效果分析 (采样10个批次):")
+        label_counts_total = {}
+        num_test_batches = 10
+        
+        for i in range(num_test_batches):
+            try:
+                _, batch_labels = next(train_iter)
+                for label in batch_labels.numpy():
+                    label_counts_total[label] = label_counts_total.get(label, 0) + 1
+            except StopIteration:
+                train_iter = iter(train_loader)  # 重新开始
+                _, batch_labels = next(train_iter)
+                for label in batch_labels.numpy():
+                    label_counts_total[label] = label_counts_total.get(label, 0) + 1
+        
+        total_samples = sum(label_counts_total.values())
+        print(f"采样结果 ({total_samples} 个样本):")
+        for label, count in sorted(label_counts_total.items()):
+            percentage = (count / total_samples) * 100
+            print(f"  标签 {label}: {count} 样本 ({percentage:.1f}%)")
         
         # 测试验证集
         val_iter = iter(val_loader)
         batch_data, batch_labels = next(val_iter)
-        print(f"验证批次数据形状: {batch_data.shape}")
+        print(f"\n验证批次数据形状: {batch_data.shape}")
         print(f"验证批次标签形状: {batch_labels.shape}")
-        print(f"验证标签样例: {batch_labels[:5]}")
+        print(f"验证标签样例: {batch_labels}")
         
         # 验证标签范围
         train_labels_set = set(data_manager.train_labels)
         val_labels_set = set(data_manager.val_labels)
-        print(f"训练集标签范围: {train_labels_set}")
+        print(f"\n训练集标签范围: {train_labels_set}")
         print(f"验证集标签范围: {val_labels_set}")
         
     except Exception as e:
