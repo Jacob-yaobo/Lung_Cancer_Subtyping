@@ -1,0 +1,46 @@
+experiment:
+  name: "baseline_pet_2class"
+  seed: 42
+  output_dir: "training_results/baseline_pet_2class"   # 训练产物保存目录
+  description: "只使用PET数据，进行ADC vs SCC的二分类任务，针对全部lung区域的3D实验"
+
+paths:
+  subjects_csv: "dataset/manifest.csv"      # 列包含: pid, center, pathology, fold_id
+  splits_json:  "dataset/split.json"        # 5-fold的各个fold划分的train_pids, val_pids
+  tasks_json:  "task.json"          # 定义 include_labels + label_map
+  data_root:  "dataset/h5file"              # 存储数据的HDF5文件，包含了ct_data, pet_data, lesion_mask, lung_mask四个dataset; 以及pid, center, pathology, fold_id四个attribute
+
+data:
+  task_name: "ADC_vs_SCC"                     # 对应 tasks.json
+  fold: "fold_0"                               # 对应 splits.json
+  modalities: ["PET"]
+  split_train: "train_pids"
+  split_val: "val_pids"
+  dtype: "float32"                            # "float32" | "float16"
+
+model:
+  architecture: "resnet18"                     # resnet10, resnet18, resnet34, resnet50
+  num_classes: 2                               # 分类类别数 (ADC vs SCC)
+  dropout_rate: 0.5                            # Dropout率
+  pretrained_path: null                        # 预训练权重路径（可选）
+
+training:
+  learning_rate: 0.0001                        # 学习率 (1e-4)
+  weight_decay: 0.1                        # 权重衰减 (1e-1)
+  num_epochs: 50                               # 训练轮数
+  patience: 20                                 # 早停耐心值
+  save_interval: 10                            # 保存间隔
+
+dataloader:
+  train:
+    batch_size: 8
+    shuffle: true
+    num_workers: 0
+    pin_memory: false
+    drop_last: true
+  val:
+    batch_size: 8
+    shuffle: false
+    num_workers: 0
+    pin_memory: false
+    drop_last: false

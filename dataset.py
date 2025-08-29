@@ -10,6 +10,10 @@ import torch
 import yaml
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Optional, Any, Set
+from util import get_center_abbreviation, get_pid_format
+
+# MONAI imports for data augmentation
+from monai.transforms import Compose, RandRotated
 
 class LungCancerDataset(Dataset):
     """
@@ -53,12 +57,34 @@ class LungCancerDataset(Dataset):
         # 获取当前任务和split下的PID列表
         self.pid_list = self._get_task_split_pids()
         
+        # 设置简单的数据增强
+        self._setup_transforms()
+        
         print(f"初始化 {split} 数据集:")
         print(f"- 任务: {self.task_name}")
         print(f"- Fold: {self.fold}")
         print(f"- 包含标签: {self.labels_to_include}")
         print(f"- 样本数量: {len(self.pid_list)}")
-        print(f"- 标签分布: {self._get_label_distribution()}")
+        print(f"- 数据增强: {'启用' if self.transforms else '禁用'}")
+        # print(f"- 标签分布: {self._get_label_distribution()}")
+    
+    def _setup_transforms(self):
+        """设置简单的数据增强 - 只有旋转"""
+        if self.split == "train":
+            # 训练时使用旋转增强
+            self.transforms = Compose([
+                RandRotated(
+                    keys=["image"],
+                    range_x=np.pi/12,  # ±15度
+                    range_y=np.pi/12,
+                    range_z=np.pi/12,
+                    prob=0.5,
+                    mode="bilinear"
+                )
+            ])
+        else:
+            # 验证时不使用增强
+            self.transforms = None
     
     def _load_task_config(self) -> Dict[str, Any]:
         """从tasks.json加载任务配置"""
@@ -96,16 +122,15 @@ class LungCancerDataset(Dataset):
         except FileNotFoundError:
             raise FileNotFoundError(f"找不到样本文件: {subjects_csv_path}")
         
-        # 2. 根据pathology筛选符合当前任务的PID
+        # 2. 从CSV文件中，根据pathology筛选符合当前任务的PID
         task_pids = set()
         for _, row in df.iterrows():
             if row['pathology'] in self.labels_to_include:
                 # 生成带中心缩写的PID格式 (与split.json中的格式一致)
-                center_abbr = self._get_center_abbreviation(row['center'])
-                combined_pid = f"{center_abbr}_{row['PID']}"
+                combined_pid = get_pid_format(row['center'], row['PID'])
                 task_pids.add(combined_pid)
         
-        print(f"任务 {self.task_name} 包含的样本数: {len(task_pids)}")
+        # print(f"任务 {self.task_name} 包含的样本数: {len(task_pids)}")
         
         # 3. 从splits.json获取当前fold和split的PID
         splits_json_path = self.config["paths"]["splits_json"]
@@ -122,34 +147,16 @@ class LungCancerDataset(Dataset):
             raise ValueError(f"Split key '{self.split_key}' 不存在于 {self.fold} 中")
         
         split_pids = set(splits_config[self.fold][self.split_key])
-        print(f"Fold {self.fold} {self.split} 包含的样本数: {len(split_pids)}")
+        # print(f"Fold {self.fold} {self.split} 包含的样本数: {len(split_pids)}")
         
         # 4. 取交集得到最终的PID列表
         final_pids = list(task_pids.intersection(split_pids))
-        print(f"最终交集样本数: {len(final_pids)}")
+        # print(f"最终交集样本数: {len(final_pids)}")
         
         if len(final_pids) == 0:
             raise ValueError(f"任务 {self.task_name} 在 {self.fold} {self.split} 下没有找到任何样本")
         
         return final_pids
-    
-    def _get_center_abbreviation(self, center_name: str) -> str:
-        """获取中心缩写"""
-        center_abbr_map = {
-            'AKH_nifti_637': 'AKH',
-            'Neimeng_nifti_425': 'Neimeng'
-        }
-        
-        if center_name in center_abbr_map:
-            return center_abbr_map[center_name]
-        else:
-            # 如果没有找到映射，尝试直接使用前缀
-            if 'AKH' in center_name:
-                return 'AKH'
-            elif 'Neimeng' in center_name:
-                return 'Neimeng'
-            else:
-                raise ValueError(f"未知的中心名称: {center_name}")
     
     def _get_label_distribution(self) -> Dict[str, int]:
         """获取标签分布"""
@@ -160,8 +167,7 @@ class LungCancerDataset(Dataset):
         # 创建PID到pathology的映射
         pid_to_pathology = {}
         for _, row in df.iterrows():
-            center_abbr = self._get_center_abbreviation(row['center'])
-            combined_pid = f"{center_abbr}_{row['PID']}"
+            combined_pid = get_pid_format(row['center'], row['PID'])
             pid_to_pathology[combined_pid] = row['pathology']
         
         # 统计当前PID列表的标签分布
@@ -218,6 +224,10 @@ class LungCancerDataset(Dataset):
                     else:
                         raise ValueError(f"不支持的模态: {modality}")
                     
+                    # H5数据原始维度是WHD，需要转换为DHW
+                    # WHD -> DHW: transpose(2, 1, 0)
+                    modal_data = modal_data.transpose(2, 1, 0)
+                    
                     # 转换数据类型
                     if self.dtype == "float32":
                         modal_data = modal_data.astype(np.float32)
@@ -228,9 +238,18 @@ class LungCancerDataset(Dataset):
             
             # 堆叠多模态数据 [C, D, H, W]
             if len(data_list) == 1:
-                data_tensor = torch.from_numpy(data_list[0]).unsqueeze(0)  # 添加通道维度
+                data_tensor = torch.from_numpy(data_list[0]).unsqueeze(0)  # 添加通道维度: [1, D, H, W]
             else:
-                data_tensor = torch.from_numpy(np.stack(data_list, axis=0))
+                data_tensor = torch.from_numpy(np.stack(data_list, axis=0))  # [C, D, H, W]
+            
+            # 应用数据增强（仅在训练时）
+            if self.transforms is not None:
+                # 将数据转换为MONAI字典格式
+                data_dict = {"image": data_tensor}
+                # 应用变换
+                data_dict = self.transforms(data_dict)  
+                # 获取变换后的数据
+                data_tensor = data_dict["image"]
             
             # 获取标签
             label = self.label_map[pathology]
@@ -239,8 +258,8 @@ class LungCancerDataset(Dataset):
             
         except Exception as e:
             print(f"加载样本 {combined_pid} 失败: {str(e)}")
-            # 返回零张量和默认标签
-            dummy_shape = (len(self.modalities), 96, 64, 128)  # 假设的默认形状
+            # 返回零张量和默认标签 - 使用CDHW格式
+            dummy_shape = (len(self.modalities), 128, 64, 96)  # [C, D, H, W] 格式
             dummy_tensor = torch.zeros(dummy_shape, dtype=torch.float32)
             return dummy_tensor, 0
 
@@ -285,11 +304,6 @@ def create_dataloaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
         pin_memory=val_config["pin_memory"],
         drop_last=val_config["drop_last"]
     )
-    
-    print(f"\n数据加载器创建完成:")
-    print(f"- 训练集批次数: {len(train_dataloader)}")
-    print(f"- 验证集批次数: {len(val_dataloader)}")
-    
     return train_dataloader, val_dataloader
 
 if __name__ == "__main__":
