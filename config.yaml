@@ -26,20 +26,20 @@ model:
 
 training:
   learning_rate: 0.0001                        # 学习率 (1e-4)
-  weight_decay: 0.1                        # 权重衰减 (1e-1)
+  weight_decay: 0.01                        # 权重衰减 (1e-1)
   num_epochs: 50                               # 训练轮数
   patience: 20                                 # 早停耐心值
   save_interval: 10                            # 保存间隔
 
 dataloader:
   train:
-    batch_size: 8
+    batch_size: 16
     shuffle: true
     num_workers: 0
     pin_memory: false
     drop_last: true
   val:
-    batch_size: 8
+    batch_size: 16
     shuffle: false
     num_workers: 0
     pin_memory: false
