@@ -15,81 +15,52 @@ from util import get_center_abbreviation, get_pid_format
 # MONAI imports for data augmentation
 from monai.transforms import Compose, RandRotated
 
-class LungCancerDataset(Dataset):
+
+class DataManager:
     """
-    肺癌分型数据集类
+    数据管理器类 - 负责所有元数据管理和数据准备
     
-    根据配置文件加载指定任务的数据
+    该类集中处理所有元数据的加载和过滤，避免重复的文件I/O操作
     """
     
-    def __init__(self, config: Dict[str, Any], split: str = "train"):
+    def __init__(self, config: Dict[str, Any]):
         """
-        初始化数据集
+        初始化数据管理器
         
         Args:
             config: YAML配置字典
-            split: 数据集划分 ("train" 或 "val")
         """
         self.config = config
-        self.split = split
-        
-        # 解析配置
         self.data_root = config["paths"]["data_root"]
-
         self.task_name = config["data"]["task_name"]
-        self.fold = config["data"]["fold"] 
+        self.fold = config["data"]["fold"]
         self.modalities = config["data"]["modalities"]
         self.dtype = config["data"]["dtype"]
         
-        # 根据split确定对应的PID键名
-        if split == "train":
-            self.split_key = config["data"]["split_train"]  # "train_pids"
-        elif split == "val":
-            self.split_key = config["data"]["split_val"]    # "val_pids"
-        else:
-            raise ValueError(f"不支持的split类型: {split}")
+        # 加载所有必要的元数据
+        self._load_metadata()
         
-        # 加载任务配置
-        self.task_config = self._load_task_config()
-        self.labels_to_include = self.task_config["labels_to_include"]
-        self.label_map = self.task_config["label_map"]
+        # 处理数据过滤和分割
+        self._process_data()
         
-        # 获取当前任务和split下的PID列表
-        self.pid_list = self._get_task_split_pids()
+        # 验证数据完整性
+        assert len(self.train_pids) == len(self.train_labels), \
+            f"训练PID和标签数量不匹配: {len(self.train_pids)} vs {len(self.train_labels)}"
+        assert len(self.val_pids) == len(self.val_labels), \
+            f"验证PID和标签数量不匹配: {len(self.val_pids)} vs {len(self.val_labels)}"
         
-        # 设置简单的数据增强
-        self._setup_transforms()
-        
-        print(f"初始化 {split} 数据集:")
+        print(f"DataManager初始化完成:")
         print(f"- 任务: {self.task_name}")
         print(f"- Fold: {self.fold}")
         print(f"- 包含标签: {self.labels_to_include}")
-        print(f"- 样本数量: {len(self.pid_list)}")
-        print(f"- 数据增强: {'启用' if self.transforms else '禁用'}")
-        # print(f"- 标签分布: {self._get_label_distribution()}")
+        print(f"- 训练样本数: {len(self.train_pids)}")
+        print(f"- 验证样本数: {len(self.val_pids)}")
+        print(f"- 训练标签分布: {self.train_class_counts}")
     
-    def _setup_transforms(self):
-        """设置简单的数据增强 - 只有旋转"""
-        if self.split == "train":
-            # 训练时使用旋转增强
-            self.transforms = Compose([
-                RandRotated(
-                    keys=["image"],
-                    range_x=np.pi/12,  # ±15度
-                    range_y=np.pi/12,
-                    range_z=np.pi/12,
-                    prob=0.5,
-                    mode="bilinear"
-                )
-            ])
-        else:
-            # 验证时不使用增强
-            self.transforms = None
-    
-    def _load_task_config(self) -> Dict[str, Any]:
-        """从tasks.json加载任务配置"""
+    def _load_metadata(self):
+        """加载所有元数据文件"""
+        # 加载任务配置
         tasks_json_path = self.config["paths"]["tasks_json"]
-        
         try:
             with open(tasks_json_path, 'r', encoding='utf-8') as f:
                 tasks_config = json.load(f)
@@ -97,91 +68,107 @@ class LungCancerDataset(Dataset):
             if self.task_name not in tasks_config:
                 raise ValueError(f"任务 '{self.task_name}' 不存在于 {tasks_json_path} 中")
             
-            return tasks_config[self.task_name]
+            task_config = tasks_config[self.task_name]
+            self.labels_to_include = task_config["labels_to_include"]
+            self.label_map = task_config["label_map"]
             
         except FileNotFoundError:
             raise FileNotFoundError(f"找不到任务配置文件: {tasks_json_path}")
         except json.JSONDecodeError as e:
             raise ValueError(f"任务配置文件格式错误: {str(e)}")
-    
-    def _get_task_split_pids(self) -> List[str]:
-        """
-        获取当前任务和split下的PID列表
         
-        流程:
-        1. 从tasks.json获取labels_to_include
-        2. 从subjects.csv根据pathology筛选出符合任务的PID
-        3. 从splits.json获取当前fold和split的PID
-        4. 取交集得到最终的PID列表
-        """
-        
-        # 1. 从subjects.csv加载所有样本
+        # 加载样本信息
         subjects_csv_path = self.config["paths"]["subjects_csv"]
         try:
-            df = pd.read_csv(subjects_csv_path)
+            self.subjects_df = pd.read_csv(subjects_csv_path)
         except FileNotFoundError:
             raise FileNotFoundError(f"找不到样本文件: {subjects_csv_path}")
         
-        # 2. 从CSV文件中，根据pathology筛选符合当前任务的PID
-        task_pids = set()
-        for _, row in df.iterrows():
-            if row['pathology'] in self.labels_to_include:
-                # 生成带中心缩写的PID格式 (与split.json中的格式一致)
-                combined_pid = get_pid_format(row['center'], row['PID'])
-                task_pids.add(combined_pid)
-        
-        # print(f"任务 {self.task_name} 包含的样本数: {len(task_pids)}")
-        
-        # 3. 从splits.json获取当前fold和split的PID
+        # 加载数据分割信息
         splits_json_path = self.config["paths"]["splits_json"]
         try:
             with open(splits_json_path, 'r', encoding='utf-8') as f:
-                splits_config = json.load(f)
+                self.splits_config = json.load(f)
         except FileNotFoundError:
             raise FileNotFoundError(f"找不到数据划分文件: {splits_json_path}")
         
-        if self.fold not in splits_config:
+        if self.fold not in self.splits_config:
             raise ValueError(f"Fold '{self.fold}' 不存在于 {splits_json_path} 中")
-        
-        if self.split_key not in splits_config[self.fold]:
-            raise ValueError(f"Split key '{self.split_key}' 不存在于 {self.fold} 中")
-        
-        split_pids = set(splits_config[self.fold][self.split_key])
-        # print(f"Fold {self.fold} {self.split} 包含的样本数: {len(split_pids)}")
-        
-        # 4. 取交集得到最终的PID列表
-        final_pids = list(task_pids.intersection(split_pids))
-        # print(f"最终交集样本数: {len(final_pids)}")
-        
-        if len(final_pids) == 0:
-            raise ValueError(f"任务 {self.task_name} 在 {self.fold} {self.split} 下没有找到任何样本")
-        
-        return final_pids
     
-    def _get_label_distribution(self) -> Dict[str, int]:
-        """获取标签分布"""
-        # 加载subjects.csv获取pathology信息
-        subjects_csv_path = self.config["paths"]["subjects_csv"]
-        df = pd.read_csv(subjects_csv_path)
+    def _process_data(self):
+        """处理数据过滤和分割"""
+        # 1. 初始筛选：筛选出符合任务标签的样本
+        task_mask = self.subjects_df['pathology'].isin(self.labels_to_include)
+        task_subjects_df = self.subjects_df[task_mask].copy()
         
-        # 创建PID到pathology的映射
-        pid_to_pathology = {}
-        for _, row in df.iterrows():
-            combined_pid = get_pid_format(row['center'], row['PID'])
-            pid_to_pathology[combined_pid] = row['pathology']
+        # 2. 生成 combined_pid 列
+        task_subjects_df['combined_pid'] = task_subjects_df.apply(
+            lambda row: get_pid_format(row['center'], row['PID']), axis=1
+        )
         
-        # 统计当前PID列表的标签分布
-        label_count = {}
-        for pid in self.pid_list:
-            if pid in pid_to_pathology:
-                pathology = pid_to_pathology[pid]
-                label_count[pathology] = label_count.get(pathology, 0) + 1
+        # 3. 获取当前fold的训练和验证PID，用于后续筛选
+        fold_config = self.splits_config[self.fold]
+        split_train_key = self.config["data"]["split_train"]
+        split_val_key = self.config["data"]["split_val"]
+
+        fold_train_pids_set = set(fold_config.get(split_train_key, []))
+        fold_val_pids_set = set(fold_config.get(split_val_key, []))
+
+        # 4. 筛选出最终的训练和验证的 DataFrame
+        train_mask = task_subjects_df['combined_pid'].isin(fold_train_pids_set)
+        val_mask = task_subjects_df['combined_pid'].isin(fold_val_pids_set)
+
+        train_df = task_subjects_df[train_mask].sort_values(by='combined_pid').reset_index(drop=True)
+        val_df = task_subjects_df[val_mask].sort_values(by='combined_pid').reset_index(drop=True)
         
-        return label_count
+        # 5. 从最终的DataFrame中派生出所有需要的属性
+        self.train_pids = train_df['combined_pid'].tolist()
+        self.val_pids = val_df['combined_pid'].tolist()
+        # 完成label map
+        self.train_labels = train_df['pathology'].map(self.label_map).tolist()
+        self.val_labels = val_df['pathology'].map(self.label_map).tolist()
+        
+        self.train_class_counts = train_df['pathology'].value_counts().to_dict()
+        
+        # 创建完整的PID到pathology映射 (用于可能的外部查询)
+        self.pid_to_pathology = dict(zip(task_subjects_df['combined_pid'], task_subjects_df['pathology']))
+        
+        # 检查样本数量
+        if len(self.train_pids) == 0:
+            raise ValueError(f"任务 {self.task_name} 在 {self.fold} train 下没有找到任何样本")
+        if len(self.val_pids) == 0:
+            raise ValueError(f"任务 {self.task_name} 在 {self.fold} val 下没有找到任何样本")
+
+
+class LungCancerDataset(Dataset):
+    
+    def __init__(self, data_root: str, pids: List[str], labels: List[int], 
+                 modalities: List[str], dtype: str, transforms: Optional[Compose] = None):
+        """
+        初始化数据集
+        
+        Args:
+            data_root: H5文件根目录
+            pids: PID列表
+            labels: 对应的标签列表
+            modalities: 模态列表
+            dtype: 数据类型
+            transforms: 数据增强变换
+        """
+        self.data_root = data_root
+        self.pids = pids
+        self.labels = labels
+        self.modalities = modalities
+        self.dtype = dtype
+        self.transforms = transforms
+        
+        # 验证输入数据的一致性
+        assert len(self.pids) == len(self.labels), \
+            f"PID和标签数量不匹配: {len(self.pids)} vs {len(self.labels)}"
     
     def __len__(self) -> int:
         """返回数据集大小"""
-        return len(self.pid_list)
+        return len(self.pids)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         """
@@ -193,11 +180,12 @@ class LungCancerDataset(Dataset):
         Returns:
             tuple: (数据张量, 标签)
         """
-        combined_pid = self.pid_list[idx]
+        pid = self.pids[idx]
+        label = self.labels[idx]
         
         try:
             # 构建H5文件路径
-            h5_filename = f"{combined_pid}.h5"
+            h5_filename = f"{pid}.h5"
             h5_filepath = os.path.join(self.data_root, h5_filename)
             
             if not os.path.exists(h5_filepath):
@@ -205,15 +193,6 @@ class LungCancerDataset(Dataset):
             
             # 从H5文件加载数据
             with h5py.File(h5_filepath, 'r') as h5f:
-                # 获取pathology标签
-                pathology = h5f.attrs['pathology']
-                if isinstance(pathology, bytes):
-                    pathology = pathology.decode('utf-8')
-                
-                # 检查标签是否在当前任务中
-                if pathology not in self.labels_to_include:
-                    raise ValueError(f"样本 {combined_pid} 的标签 {pathology} 不在任务 {self.task_name} 中")
-                
                 # 加载指定模态的数据
                 data_list = []
                 for modality in self.modalities:
@@ -242,7 +221,7 @@ class LungCancerDataset(Dataset):
             else:
                 data_tensor = torch.from_numpy(np.stack(data_list, axis=0))  # [C, D, H, W]
             
-            # 应用数据增强（仅在训练时）
+            # 应用数据增强（如果提供）
             if self.transforms is not None:
                 # 将数据转换为MONAI字典格式
                 data_dict = {"image": data_tensor}
@@ -251,19 +230,16 @@ class LungCancerDataset(Dataset):
                 # 获取变换后的数据
                 data_tensor = data_dict["image"]
             
-            # 获取标签
-            label = self.label_map[pathology]
-            
             return data_tensor, label
             
         except Exception as e:
-            print(f"加载样本 {combined_pid} 失败: {str(e)}")
-            # 返回零张量和默认标签 - 使用CDHW格式
+            print(f"加载样本 {pid} 失败: {str(e)}")
+            # 返回零张量和对应标签 - 使用CDHW格式
             dummy_shape = (len(self.modalities), 128, 64, 96)  # [C, D, H, W] 格式
             dummy_tensor = torch.zeros(dummy_shape, dtype=torch.float32)
-            return dummy_tensor, 0
+            return dummy_tensor, label
 
-def load_config(config_path: str = "congfig.yaml") -> Dict[str, Any]:
+def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
     """加载YAML配置文件"""
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -275,12 +251,62 @@ def load_config(config_path: str = "congfig.yaml") -> Dict[str, Any]:
     except yaml.YAMLError as e:
         raise ValueError(f"配置文件格式错误: {str(e)}")
 
-def create_dataloaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
-    """创建训练和验证数据加载器"""
+
+def get_transforms(split: str) -> Optional[Compose]:
+    """设置数据增强变换"""
+    if split == "train":
+        # 训练时使用旋转增强
+        return Compose([
+            RandRotated(
+                keys=["image"],
+                range_x=np.pi/12,  # ±15度
+                range_y=np.pi/12,
+                range_z=np.pi/12,
+                prob=0.5,
+                mode="bilinear"
+            )
+        ])
+    else:
+        # 验证时不使用增强
+        return None
+
+
+def create_dataloaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, DataManager]:
+    """
+    创建训练和验证数据加载器
     
-    # 创建数据集
-    train_dataset = LungCancerDataset(config, split="train")
-    val_dataset = LungCancerDataset(config, split="val")
+    Args:
+        config: YAML配置字典
+        
+    Returns:
+        tuple: (训练数据加载器, 验证数据加载器, 数据管理器)
+    """
+    
+    # 创建数据管理器 - 只需实例化一次
+    data_manager = DataManager(config)
+    
+    # 设置数据增强变换
+    train_transforms = get_transforms("train")
+    val_transforms = get_transforms("val")
+    
+    # 创建数据集实例
+    train_dataset = LungCancerDataset(
+        data_root=data_manager.data_root,
+        pids=data_manager.train_pids,
+        labels=data_manager.train_labels,
+        modalities=data_manager.modalities,
+        dtype=data_manager.dtype,
+        transforms=train_transforms
+    )
+    
+    val_dataset = LungCancerDataset(
+        data_root=data_manager.data_root,
+        pids=data_manager.val_pids,
+        labels=data_manager.val_labels,
+        modalities=data_manager.modalities,
+        dtype=data_manager.dtype,
+        transforms=val_transforms
+    )
     
     # 获取数据加载器配置
     train_config = config["dataloader"]["train"]
@@ -304,17 +330,29 @@ def create_dataloaders(config: Dict[str, Any]) -> Tuple[DataLoader, DataLoader]:
         pin_memory=val_config["pin_memory"],
         drop_last=val_config["drop_last"]
     )
-    return train_dataloader, val_dataloader
+    
+    print(f"\n数据加载器创建完成:")
+    print(f"- 训练数据增强: {'启用' if train_transforms else '禁用'}")
+    print(f"- 验证数据增强: {'启用' if val_transforms else '禁用'}")
+    
+    return train_dataloader, val_dataloader, data_manager
 
 if __name__ == "__main__":
     # 测试代码
-    print("测试Dataset类...")
+    print("测试重构后的Dataset类...")
     
     # 加载配置
-    config = load_config("congfig.yaml")
+    config = load_config("config.yaml")
     
-    # 创建数据加载器
-    train_loader, val_loader = create_dataloaders(config)
+    # 创建数据加载器和数据管理器
+    train_loader, val_loader, data_manager = create_dataloaders(config)
+    
+    # 显示数据管理器统计信息
+    print(f"\n数据管理器统计:")
+    print(f"- 标签映射: {data_manager.label_map}")
+    print(f"- 训练类别分布: {data_manager.train_class_counts}")
+    print(f"- 训练样本数: {len(data_manager.train_pids)}")
+    print(f"- 验证样本数: {len(data_manager.val_pids)}")
     
     # 测试加载一个批次
     print("\n测试数据加载:")
@@ -332,6 +370,12 @@ if __name__ == "__main__":
         print(f"验证批次数据形状: {batch_data.shape}")
         print(f"验证批次标签形状: {batch_labels.shape}")
         print(f"验证标签样例: {batch_labels[:5]}")
+        
+        # 验证标签范围
+        train_labels_set = set(data_manager.train_labels)
+        val_labels_set = set(data_manager.val_labels)
+        print(f"训练集标签范围: {train_labels_set}")
+        print(f"验证集标签范围: {val_labels_set}")
         
     except Exception as e:
         print(f"数据加载测试失败: {str(e)}")
