@@ -1,0 +1,8 @@
+预处理流程：
+1. 构建metadata.csv文件，统计具有的数据； 在metadata.ipynb内完成；
+2. 获取尺寸的finger，得到数据的shape与spacing分布； 在finger.ipynb中完成；
+3. resample操作；
+4. crop
+5. value归一化
+
+#TODO
